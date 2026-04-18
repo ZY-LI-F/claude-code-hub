@@ -1,0 +1,14 @@
+# Runtime state (project-side, not plugin-side — but included for dev convenience)
+.spec-loop/
+reviews/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Test artifacts
+*.log
+*.tmp

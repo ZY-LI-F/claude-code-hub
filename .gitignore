@@ -1,0 +1,25 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node (if any plugin ends up needing it)
+node_modules/
+
+# Claude Code local working state (per-project, not shared)
+.claude/settings.local.json
+.spec-loop/
+
+# Helper-script artifacts
+*.log
+*.tmp
+*.tmp.*

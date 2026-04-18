@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/stop-hook.sh\"",
+            "timeout": 1800
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/post-test-hook.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "spec-loop",
+  "version": "0.1.0",
+  "description": "Spec-driven nested loop: Claude Code plans & analyzes, Codex implements & reviews, tests gate the outer loop. Inspired by Meta-Harness (Lee et al., 2026) and forked from claude-review-loop.",
+  "author": { "name": "spec-loop contributors" }
+}
