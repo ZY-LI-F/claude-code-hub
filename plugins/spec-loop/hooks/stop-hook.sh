@@ -159,7 +159,19 @@ EOF
 fi
 
 # ============================================================
-# Phase machine
+# Mode dispatch (v0.2)
+# ============================================================
+MODE=$(state_mode)
+log_info "stop-hook: mode=$MODE"
+if [[ "$MODE" == "multi" ]]; then
+  # shellcheck disable=SC1091
+  source "${PLUGIN_ROOT}/hooks/stop-hook-multi.sh"
+  _multi_phase_machine
+  exit $?
+fi
+
+# ============================================================
+# Phase machine (single-task legacy, unchanged)
 # ============================================================
 case "$PHASE" in
   idle)

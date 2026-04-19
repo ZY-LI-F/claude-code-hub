@@ -7,11 +7,11 @@
   "plugins": [
     {
       "name": "spec-loop",
-      "description": "Nested-loop coding harness: Claude plans and analyzes, Codex implements and reviews, tests gate the outer loop. Inspired by claude-review-loop, claude-codex, and the Meta-Harness paper.",
-      "version": "0.1.0",
+      "description": "Nested-loop coding harness. v0.2: single-task mode preserved; new multi-task mode plans a DAG, runs <=3 tasks per wave in parallel worktrees, then runs up to 5 whole-project review/fix/test rounds.",
+      "version": "0.2.0",
       "source": "./plugins/spec-loop",
       "category": "development",
-      "homepage": "https://github.com/your-handle/spec-loop"
+      "homepage": "https://github.com/ZY-LI-F/claude-code-hub"
     }
   ]
 }

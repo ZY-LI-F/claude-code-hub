@@ -1,6 +1,6 @@
 {
   "name": "spec-loop",
-  "version": "0.1.0",
-  "description": "Spec-driven nested loop: Claude Code plans & analyzes, Codex implements & reviews, tests gate the outer loop. Inspired by Meta-Harness (Lee et al., 2026) and forked from claude-review-loop.",
+  "version": "0.2.0",
+  "description": "Spec-driven nested loop. v0.2 adds multi-task mode (/spec-loop:multi-start): Claude plans a DAG, up to 3 tasks run in parallel per wave in git worktrees, then Codex runs up to 5 rounds of whole-project review/fix/test. Single-task mode (/spec-loop:spec-start) preserved.",
   "author": { "name": "spec-loop contributors" }
 }

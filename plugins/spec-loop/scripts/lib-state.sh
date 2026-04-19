@@ -22,6 +22,10 @@ export SPEC_LOOP_SPEC="${SPEC_LOOP_DIR}/spec.md"
 export SPEC_LOOP_PLAN="${SPEC_LOOP_DIR}/plan.md"
 export SPEC_LOOP_LOG="${SPEC_LOOP_DIR}/spec-loop.log"
 export SPEC_LOOP_ITER_DIR="${SPEC_LOOP_DIR}/iterations"
+# v0.2 multi-task paths
+export SPEC_LOOP_TASKS="${SPEC_LOOP_DIR}/tasks.json"
+export SPEC_LOOP_BATCHES_DIR="${SPEC_LOOP_DIR}/batches"
+export SPEC_LOOP_GLOBAL_DIR="${SPEC_LOOP_DIR}/global"
 
 # ============================================================
 # Budgets (env-overridable)
@@ -37,6 +41,10 @@ export SPEC_LOOP_MAX_OSCILLATION_STREAK="${SPEC_LOOP_MAX_OSCILLATION_STREAK:-5}"
 # Testing-phase nudge cap: how many times Stop hook can nag Claude to run
 # tests before declaring the loop stuck.
 export SPEC_LOOP_MAX_TESTING_NUDGES="${SPEC_LOOP_MAX_TESTING_NUDGES:-3}"
+# v0.2 multi-task budgets
+export SPEC_LOOP_MAX_PARALLEL="${SPEC_LOOP_MAX_PARALLEL:-3}"
+export SPEC_LOOP_MAX_GLOBAL_ROUNDS="${SPEC_LOOP_MAX_GLOBAL_ROUNDS:-5}"
+export SPEC_LOOP_TASK_TIMEOUT_SECONDS="${SPEC_LOOP_TASK_TIMEOUT_SECONDS:-1800}"
 # Default to danger-full-access per user choice; isolated env only!
 export SPEC_LOOP_CODEX_FLAGS="${SPEC_LOOP_CODEX_FLAGS:---dangerously-bypass-approvals-and-sandbox}"
 
@@ -131,17 +139,21 @@ state_exists() {
 }
 
 state_init() {
+  # Usage: state_init <session_id> [mode]
+  #   mode: "single" (default, legacy) | "multi"
   local session_id="$1"
+  local mode="${2:-single}"
   local ts
   ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   mkdir -p "$SPEC_LOOP_DIR" "$SPEC_LOOP_ITER_DIR"
   # Build JSON via Python to guarantee safe quoting of session_id.
   local content
-  content=$(python3 - "$session_id" "$ts" <<'PY'
-import json, sys
-session_id, ts = sys.argv[1], sys.argv[2]
+  content=$(python3 - "$session_id" "$ts" "$mode" <<'PY'
+import json, sys, os
+session_id, ts, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 state = {
     "session_id": session_id,
+    "mode": mode,
     "phase": "idle",
     "outer_iter": 0,
     "inner_iter": 0,
@@ -154,6 +166,13 @@ state = {
     "created_at": ts,
     "updated_at": ts,
 }
+if mode == "multi":
+    state.update({
+        "max_parallel": int(os.environ.get("SPEC_LOOP_MAX_PARALLEL", "3")),
+        "current_wave": 0,
+        "global_round": 0,
+        "max_global_rounds": int(os.environ.get("SPEC_LOOP_MAX_GLOBAL_ROUNDS", "5")),
+    })
 print(json.dumps(state, indent=2))
 PY
 )
@@ -245,4 +264,35 @@ session_matches() {
   local stored
   stored=$(state_get session_id)
   [[ -n "$stored" && "$stored" == "$incoming" ]]
+}
+
+# ============================================================
+# Mode helpers (v0.2)
+# ============================================================
+state_mode() {
+  # Returns "single" (default, legacy) or "multi". Missing field → single.
+  local m
+  m=$(state_get mode)
+  [[ -z "$m" ]] && m="single"
+  printf '%s' "$m"
+}
+
+# ============================================================
+# Multi-mode iteration directory helpers (v0.2)
+# ============================================================
+current_wave_dir() {
+  local n
+  n=$(state_get current_wave); n=${n:-0}
+  printf '%s/wave-%03d' "$SPEC_LOOP_BATCHES_DIR" "$n"
+}
+
+task_dir() {
+  # Usage: task_dir <task_id>
+  printf '%s/task-%s' "$(current_wave_dir)" "$1"
+}
+
+current_global_round_dir() {
+  local n
+  n=$(state_get global_round); n=${n:-0}
+  printf '%s/round-%03d' "$SPEC_LOOP_GLOBAL_DIR" "$n"
 }
