@@ -1,6 +1,6 @@
 {
   "name": "spec-loop",
-  "version": "0.2.0",
-  "description": "Spec-driven nested loop. v0.2 adds multi-task mode (/spec-loop:multi-start): Claude plans a DAG, up to 3 tasks run in parallel per wave in git worktrees, then Codex runs up to 5 rounds of whole-project review/fix/test. Single-task mode (/spec-loop:spec-start) preserved.",
+  "version": "0.3.0",
+  "description": "Spec-driven nested loop. v0.3: tests-first convergence, multi-signal codex-done detection, auto-advance waves + auto-rescue failed tasks, cherry-pick merge fallback, strict global-review prompt with drift retry, new /spec-rebind + /spec-resume commands. v0.2 multi-mode entry /spec-loop:multi-start preserved.",
   "author": { "name": "spec-loop contributors" }
 }

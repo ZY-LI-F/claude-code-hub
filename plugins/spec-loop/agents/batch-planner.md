@@ -74,6 +74,48 @@ Schema:
    - no wave contains more than `max_parallel` tasks
    - every `task_md` path exists on disk
 
+## 4bis. Cross-task contract conflict scan (v0.3 requirement)
+
+Before writing tasks.json, perform a **contract-collision pass**. For each
+task, list:
+
+- **Provides**: public symbols, schemas, files, test invariants it creates.
+- **Consumes**: symbols, schemas, files, tests it depends on.
+
+Then scan for collisions. A collision is when:
+- Two tasks touch the same public symbol with incompatible semantics, OR
+- One task's test asserts an invariant that another task's required
+  behaviour violates (e.g. "insert rejects duplicates" vs "resume re-inserts
+  idempotently").
+
+For each collision, emit a `conflicts_with` array on both tasks and
+**choose one of three resolution strategies** in `task.md`:
+
+1. **Split the API**: add a second symbol (e.g. `upsert_stage` alongside
+   `insert_stage`) so both invariants can coexist.
+2. **Add `depends_on`**: force serialisation if a conflict is
+   order-sensitive.
+3. **Defer**: flag the collision as a known global-review item in
+   `.spec-loop/global/deferred-from-waves.md` rather than risk burning inner
+   iterations on unresolvable reviewer loops.
+
+Record the scan result at the bottom of `plan.md` as a `## Contract
+Collisions` section (or extend the existing one). Running codex should not
+have to rediscover these conflicts at iter 5.
+
+### Narrow test_command guidance (v0.3)
+
+Each task's `test_command` MUST target **only** the test files it introduces
+or directly modifies. Using `pytest -q` (run-everything) at per-task scope
+causes cross-task regressions to drag unrelated tasks into oscillation —
+full-repo pytest is the job of the global-testing phase, not per-task.
+
+Correct: `pytest tests/server/test_run_service.py tests/server/test_resume.py -q`
+Wrong:   `pytest -q`
+
+For front-end tasks without backend exposure, use narrow web tests or
+`cd web && npm run typecheck` only.
+
 ## Quality bar
 
 - Each task summary should be scannable in <10s.

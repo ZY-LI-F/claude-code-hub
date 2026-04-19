@@ -25,7 +25,10 @@ fi
 DIFF_FILE="$ROUND_DIR/diff.patch"
 ( cd "$CLAUDE_PROJECT_DIR" && git diff "$BASE" HEAD ) > "$DIFF_FILE" 2>/dev/null || true
 
-DIFF_CAP="${SPEC_LOOP_MAX_DIFF_BYTES:-204800}"
+# v0.3: cap at 50 KB (was 200 KB). Codex drifts into essay mode on huge
+# prompts; forcing a compact diff keeps the review focused on top-level
+# integration risks rather than line-by-line nitpicking.
+DIFF_CAP="${SPEC_LOOP_GLOBAL_DIFF_CAP:-51200}"
 DIFF_SNIPPET=$(head -c "$DIFF_CAP" "$DIFF_FILE")
 DIFF_BYTES=$(wc -c < "$DIFF_FILE" | tr -d ' ')
 
@@ -34,6 +37,28 @@ REVIEW_FILE="$ROUND_DIR/codex-review.md"
 
 cat > "$PROMPT_FILE" <<EOF
 # Whole-Project Review (round $ROUND)
+
+**Output format is hard-enforced. Ignore it and this round is wasted.**
+
+The FIRST THREE LINES of your response MUST be:
+
+\`\`\`
+VERDICT: APPROVED
+SUMMARY: <one-sentence summary>
+FINDINGS: <n>
+\`\`\`
+
+or, if there are any blocking issues:
+
+\`\`\`
+VERDICT: NEEDS_CHANGES
+SUMMARY: <one-sentence summary>
+FINDINGS: <n>
+\`\`\`
+
+Then list findings (one per block, at most 10). Do NOT write prose essays
+about software methodology, complexity transfer, or team roles — this is a
+code review, keep it mechanical.
 
 You are the *senior* reviewer for an entire multi-task delivery. Many atomic
 tasks have been merged into the main branch; now judge the result as a whole.
@@ -74,20 +99,21 @@ Focus on integration issues that single-task reviews cannot see:
 4. **Security regressions**: leaked secrets, unsafe defaults, auth gaps.
 5. **Tests**: total coverage gaps, flaky patterns, tests that only pass in isolation.
 
-## Output format
+## Findings block format
 
-For each finding:
+Recap: start with the 3-line header above. For each finding use:
 
 \`\`\`
 <SEVERITY>: <title> — <file:line>
-  Rationale: ...
-  Fix: ...
+  Rationale: one sentence.
+  Fix: one sentence.
 \`\`\`
 
-Severities: BLOCKING, IMPORTANT, NIT. Be concise — this is a final gate, not a
-tutorial.
+Severities: BLOCKING, IMPORTANT, NIT. Max 10 findings total. Prefer
+elevating the most important 3-5; skip cosmetic nits entirely.
 
-End with exactly one line: \`VERDICT: APPROVED\` or \`VERDICT: NEEDS_CHANGES\`.
+The header you already wrote (VERDICT / SUMMARY / FINDINGS) is the source
+of truth for the harness — do not change it, do not echo it at the bottom.
 EOF
 
 if ! command -v codex >/dev/null 2>&1; then
@@ -98,11 +124,60 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 
 log_info "run-global-review[$ROUND]: invoking codex"
-# shellcheck disable=SC2086
-if ! codex exec $SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check - \
-       < "$PROMPT_FILE" > "$REVIEW_FILE" 2>&1; then
-  log_warn "run-global-review[$ROUND]: codex exec failed; assuming NEEDS_CHANGES"
+_invoke_codex() {
+  local out="$1"
+  # shellcheck disable=SC2086
+  codex exec $SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check - \
+    < "$PROMPT_FILE" > "$out" 2>&1
+}
+
+if ! _invoke_codex "$REVIEW_FILE"; then
+  log_warn "run-global-review[$ROUND]: codex exec failed (rc=$?); assuming NEEDS_CHANGES"
   echo "VERDICT: NEEDS_CHANGES" >> "$REVIEW_FILE"
+fi
+
+# Drift detection: if codex produced no VERDICT header in the first 20 lines,
+# it probably wandered off into essay mode. Try once more with a much
+# shorter prompt that re-emphasises the output contract.
+if ! head -20 "$REVIEW_FILE" | grep -qE '^VERDICT:\s*(APPROVED|NEEDS_CHANGES)'; then
+  log_warn "run-global-review[$ROUND]: no VERDICT in first 20 lines; retrying with strict prompt"
+  cat > "$PROMPT_FILE.retry" <<EOF
+STRICT MODE. Your reply MUST start with exactly these three lines:
+
+VERDICT: APPROVED
+SUMMARY: <one sentence>
+FINDINGS: 0
+
+or if there are issues:
+
+VERDICT: NEEDS_CHANGES
+SUMMARY: <one sentence>
+FINDINGS: <count>
+
+followed by up to 10 structured findings in the format:
+
+<SEVERITY>: <title> — <file:line>
+  Rationale: ...
+  Fix: ...
+
+Do NOT write any other prose. Here is the change summary you are judging:
+
+## Spec
+$(cat "$SPEC_LOOP_SPEC" 2>/dev/null | head -c 4096)
+
+## Diff (first 30 KB)
+\`\`\`diff
+$(head -c 30720 "$DIFF_FILE")
+\`\`\`
+EOF
+  mv "$REVIEW_FILE" "$REVIEW_FILE.drift"
+  if codex exec $SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check - \
+         < "$PROMPT_FILE.retry" > "$REVIEW_FILE" 2>&1; then
+    log_info "run-global-review[$ROUND]: strict retry complete"
+  else
+    log_error "run-global-review[$ROUND]: strict retry also failed"
+    echo "VERDICT: NEEDS_CHANGES" >> "$REVIEW_FILE"
+  fi
 fi
 
 echo "Global review round $ROUND -> $REVIEW_FILE"

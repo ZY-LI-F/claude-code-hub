@@ -34,35 +34,91 @@ EOF
 
     # ---- Step B: wave execution (mostly automated by run-wave.sh) ----
     wave-running)
-      # If the most recent wave has already been run by run-wave.sh, tasks are
-      # in terminal state; advance. Otherwise nudge Claude to run it.
+      # Distinguish three wave states: in-progress (running>0 → let background
+      # run-wave.sh continue), not-started (pending>0 → nudge Claude to run
+      # it), complete (all done/failed → advance).
       local current_wave max_wave
       current_wave=$(state_get current_wave); current_wave=${current_wave:-1}
       max_wave=$(tasks_max_wave 2>/dev/null || echo 0)
       local wave_log="${SPEC_LOOP_BATCHES_DIR}/wave-$(printf '%03d' "$current_wave")/wave.log"
 
-      local pending
-      pending=$(tasks_pending_in_wave "$current_wave" | wc -l | tr -d ' ')
+      local running pending
+      running=$(tasks_count_in_wave "$current_wave" | awk -F= '/^running=/{print $2}')
+      pending=$(tasks_count_in_wave "$current_wave" | awk -F= '/^pending=/{print $2}')
+      running=${running:-0}; pending=${pending:-0}
+
+      # Wave in progress: allow the Stop so background run-wave.sh can finish.
+      # Claude will be re-woken by the task-notification when run-wave exits.
+      if (( running > 0 )); then
+        log_info "multi: wave $current_wave in progress (running=$running); allow exit"
+        cat >&2 <<EOF
+[spec-loop multi] Wave $current_wave in progress (running=$running). Background run-wave.sh will continue; you will be re-woken when it finishes.
+Wave log: $wave_log
+EOF
+        return 0
+      fi
+
+      # Ready to advance or nudge based on pending count
       if (( pending == 0 )); then
-        # Wave done. Advance.
+        # Wave done. Auto-rescue any "failed" tasks whose branch is viable,
+        # then advance.
+        local failed_count
+        failed_count=$(tasks_count_in_wave "$current_wave" | awk -F= '/^failed=/{print $2}')
+        failed_count=${failed_count:-0}
+        if (( failed_count > 0 )); then
+          while IFS= read -r fid; do
+            fid="${fid%$'\r'}"
+            [[ -z "$fid" ]] && continue
+            log_info "multi: auto-rescue attempt for failed task $fid"
+            if bash "${PLUGIN_ROOT}/scripts/rescue-task.sh" "$fid" >> "$SPEC_LOOP_LOG" 2>&1; then
+              log_info "multi: $fid rescued automatically"
+            else
+              log_warn "multi: $fid could not be auto-rescued; remains failed"
+            fi
+          done < <(_py3 - "$SPEC_LOOP_TASKS" "$current_wave" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+w = int(sys.argv[2])
+for t in d.get('tasks', []):
+    if t.get('wave') == w and t.get('status') == 'failed':
+        print(t['id'])
+PY
+)
+        fi
+
         if (( current_wave >= max_wave )); then
           log_info "multi: all waves complete; transitioning to global-review"
           state_set phase global-review global_round 1
           cat >&2 <<EOF
-[spec-loop multi] ✓ All waves complete.
-Transition to global-review (round 1). The next stop will trigger:
-  bash "${PLUGIN_ROOT}/scripts/run-global-review.sh"
+[spec-loop multi] ✓ All waves complete. Transitioning to global-review round 1.
+Next: bash "${PLUGIN_ROOT}/scripts/run-global-review.sh"
+Or run in background:
+  setsid bash "${PLUGIN_ROOT}/scripts/run-global-review.sh" </dev/null > "${SPEC_LOOP_GLOBAL_DIR}/round-001-stdout.log" 2>&1 &
 EOF
           return 2
         else
           local next=$((current_wave + 1))
-          log_info "multi: wave $current_wave done; launching wave $next"
+          log_info "multi: wave $current_wave done; auto-launching wave $next in background"
           state_set current_wave "$next"
+          local next_dir
+          next_dir="${SPEC_LOOP_BATCHES_DIR}/wave-$(printf '%03d' "$next")"
+          mkdir -p "$next_dir"
+          # Auto-launch next wave in a detached session (survives hook exit).
+          # If setsid is unavailable, fall back to `&` + disown.
+          if command -v setsid >/dev/null 2>&1; then
+            setsid bash "${PLUGIN_ROOT}/scripts/run-wave.sh" "$next" </dev/null \
+              > "$next_dir/stdout.log" 2>&1 &
+          else
+            bash "${PLUGIN_ROOT}/scripts/run-wave.sh" "$next" </dev/null \
+              > "$next_dir/stdout.log" 2>&1 &
+          fi
+          disown 2>/dev/null || true
           cat >&2 <<EOF
-[spec-loop multi] Wave $current_wave complete. Launch wave $next:
-  bash "${PLUGIN_ROOT}/scripts/run-wave.sh" $next
+[spec-loop multi] ✓ Wave $current_wave complete. Wave $next launched in background (PID=$!).
+Log: $next_dir/stdout.log
+You'll be notified when it finishes.
 EOF
-          return 2
+          return 0  # let Stop complete so background can run freely
         fi
       else
         # Wave not yet executed (or interrupted). Nudge.
@@ -118,7 +174,7 @@ EOF
         return 2
       fi
 
-      action=$(python3 - "$decision_file" <<'PY'
+      action=$(python3 - "$decision_file" <<'PY' | tr -d '\r'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -203,7 +259,7 @@ EOF
       fi
 
       local passed
-      passed=$(python3 - "$result_file" <<'PY'
+      passed=$(python3 - "$result_file" <<'PY' | tr -d '\r'
 import json, sys
 try: print("true" if json.load(open(sys.argv[1])).get("passed") else "false")
 except Exception: print("false")

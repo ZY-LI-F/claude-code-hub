@@ -13,6 +13,16 @@ export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
 # ============================================================
+# Python wrapper: force LF line endings on stdout (Windows defaults to CRLF
+# in text mode, which poisons bash `read`/`$()` with stray \r characters).
+# All internal callers should use _py3 instead of python3 directly.
+# ============================================================
+_py3() {
+  python3 "$@" | tr -d '\r'
+}
+export -f _py3 2>/dev/null || true
+
+# ============================================================
 # Directory conventions
 # ============================================================
 : "${CLAUDE_PROJECT_DIR:=$(pwd)}"
@@ -44,7 +54,7 @@ export SPEC_LOOP_MAX_TESTING_NUDGES="${SPEC_LOOP_MAX_TESTING_NUDGES:-3}"
 # v0.2 multi-task budgets
 export SPEC_LOOP_MAX_PARALLEL="${SPEC_LOOP_MAX_PARALLEL:-3}"
 export SPEC_LOOP_MAX_GLOBAL_ROUNDS="${SPEC_LOOP_MAX_GLOBAL_ROUNDS:-5}"
-export SPEC_LOOP_TASK_TIMEOUT_SECONDS="${SPEC_LOOP_TASK_TIMEOUT_SECONDS:-1800}"
+export SPEC_LOOP_TASK_TIMEOUT_SECONDS="${SPEC_LOOP_TASK_TIMEOUT_SECONDS:-3600}"
 # Default to danger-full-access per user choice; isolated env only!
 export SPEC_LOOP_CODEX_FLAGS="${SPEC_LOOP_CODEX_FLAGS:---dangerously-bypass-approvals-and-sandbox}"
 
@@ -183,7 +193,8 @@ state_get() {
   local key="$1"
   [[ -f "$SPEC_LOOP_STATE" ]] || { echo ""; return; }
   # Path and key pass through argv — no string interpolation into Python source.
-  python3 - "$SPEC_LOOP_STATE" "$key" <<'PY'
+  # `tr -d '\r'` strips CRLF that Python's text-mode stdout adds on Windows.
+  python3 - "$SPEC_LOOP_STATE" "$key" <<'PY' | tr -d '\r'
 import json, sys
 path, key = sys.argv[1], sys.argv[2]
 try:
@@ -273,6 +284,7 @@ state_mode() {
   # Returns "single" (default, legacy) or "multi". Missing field → single.
   local m
   m=$(state_get mode)
+  m="${m%$'\r'}"; m="${m//[[:space:]]/}"
   [[ -z "$m" ]] && m="single"
   printf '%s' "$m"
 }

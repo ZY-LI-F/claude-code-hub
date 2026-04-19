@@ -24,9 +24,12 @@ WAVE_LOG="$WAVE_DIR/wave.log"
 
 state_set current_wave "$WAVE"
 
-# Gather task ids in this wave (not done/failed)
+# Gather task ids in this wave (not done/failed).
+# Strip any stray CR (Windows Python stdout) that snuck through.
 TASK_IDS=()
 while IFS= read -r tid; do
+  tid="${tid%$'\r'}"
+  tid="${tid//[[:space:]]/}"
   [[ -n "$tid" ]] && TASK_IDS+=("$tid")
 done < <(tasks_pending_in_wave "$WAVE")
 
@@ -120,11 +123,48 @@ for tid in "${TIDS_IN_ORDER[@]}"; do
   if git merge --no-ff --no-edit "$BR" >> "$WAVE_LOG" 2>&1; then
     log_info "run-wave[$WAVE]: merged $tid"
   else
+    # Merge conflict: try cherry-pick fallback for non-overlapping files.
     git merge --abort 2>/dev/null || true
-    log_error "run-wave[$WAVE]: merge conflict for $tid; reverting and marking failed"
-    tasks_update "$tid" status failed
-    tasks_append_error "$tid" "merge_conflict_with_main"
-    FAILED_MERGES+=("$tid")
+    log_warn "run-wave[$WAVE]: merge conflict for $tid; attempting cherry-pick fallback"
+    mapfile -t CHANGED < <(git diff --name-only "HEAD..${BR}" 2>/dev/null)
+    CLEAN_COUNT=0
+    CONFLICT_FILES=()
+    for f in "${CHANGED[@]}"; do
+      f="${f%$'\r'}"
+      [[ -z "$f" ]] && continue
+      # File exists on branch; check if it's different on main
+      if git ls-tree HEAD "$f" >/dev/null 2>&1; then
+        if ! git diff --quiet "HEAD" "${BR}" -- "$f" 2>/dev/null; then
+          CONFLICT_FILES+=("$f")
+          continue
+        fi
+      fi
+      # Either the file is new (not on main) or unchanged on main → safe to adopt
+      git checkout "$BR" -- "$f" >>"$WAVE_LOG" 2>&1 && CLEAN_COUNT=$((CLEAN_COUNT+1))
+    done
+    if (( CLEAN_COUNT > 0 )); then
+      git add -A >/dev/null 2>&1 || true
+      git commit -m "wave-${WAVE} fallback(${tid}): cherry-pick non-overlapping files" >>"$WAVE_LOG" 2>&1 || true
+      log_warn "run-wave[$WAVE]: cherry-picked $CLEAN_COUNT file(s) from $tid; ${#CONFLICT_FILES[@]} conflict file(s) deferred"
+      if (( ${#CONFLICT_FILES[@]} > 0 )); then
+        mkdir -p "$SPEC_LOOP_GLOBAL_DIR"
+        {
+          echo ""
+          echo "## $tid — conflicting files (wave $WAVE)"
+          echo ""
+          echo "These files were touched by both main and $tid; cherry-pick fallback"
+          echo "skipped them. Global-review must decide integration:"
+          for cf in "${CONFLICT_FILES[@]}"; do echo "- \`$cf\`"; done
+        } >> "$SPEC_LOOP_GLOBAL_DIR/deferred-from-waves.md"
+      fi
+      # The task's code is mostly integrated → mark done so wave can advance.
+      tasks_update "$tid" status done completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    else
+      log_error "run-wave[$WAVE]: cherry-pick found 0 clean files for $tid; marking failed"
+      tasks_update "$tid" status failed
+      tasks_append_error "$tid" "merge_conflict_no_clean_files"
+      FAILED_MERGES+=("$tid")
+    fi
   fi
 done
 

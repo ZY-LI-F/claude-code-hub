@@ -90,9 +90,12 @@ tasks_read_raw() {
 
 # ---- Queries (read-only) ----
 
+# Strip CRLF that Python prints on Windows text-mode stdout.
+_strip_cr() { tr -d '\r'; }
+
 tasks_list_ids() {
   _require_tasks_file || return 1
-  python3 - "$SPEC_LOOP_TASKS" <<'PY'
+  python3 - "$SPEC_LOOP_TASKS" <<'PY' | _strip_cr
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -104,7 +107,7 @@ PY
 tasks_get_field() {
   # Usage: tasks_get_field <task_id> <field>
   _require_tasks_file || return 1
-  python3 - "$SPEC_LOOP_TASKS" "$1" "$2" <<'PY'
+  python3 - "$SPEC_LOOP_TASKS" "$1" "$2" <<'PY' | _strip_cr
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -123,7 +126,7 @@ PY
 tasks_count_by_status() {
   # Prints key=count lines for each status.
   _require_tasks_file || return 1
-  python3 - "$SPEC_LOOP_TASKS" <<'PY'
+  python3 - "$SPEC_LOOP_TASKS" <<'PY' | _strip_cr
 import json, sys, collections
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -137,7 +140,7 @@ tasks_pending_in_wave() {
   # Usage: tasks_pending_in_wave <wave_num>
   # Prints ids of tasks in that wave whose status is not in {done,failed}.
   _require_tasks_file || return 1
-  python3 - "$SPEC_LOOP_TASKS" "$1" <<'PY'
+  python3 - "$SPEC_LOOP_TASKS" "$1" <<'PY' | _strip_cr
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
@@ -145,6 +148,30 @@ w = int(sys.argv[2])
 for t in d.get('tasks', []):
     if t.get('wave') == w and t.get('status') not in ('done','failed'):
         print(t['id'])
+PY
+}
+
+tasks_count_in_wave() {
+  # Usage: tasks_count_in_wave <wave_num>
+  # Prints "STATUS=N" lines covering pending / running / done / failed
+  # (other statuses folded into "other"). Used by the stop-hook to tell
+  # "wave is still executing" from "wave hasn't started" from "wave finished".
+  _require_tasks_file || return 1
+  python3 - "$SPEC_LOOP_TASKS" "$1" <<'PY' | _strip_cr
+import json, sys, collections
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+w = int(sys.argv[2])
+c = collections.Counter()
+for t in d.get('tasks', []):
+    if t.get('wave') == w:
+        s = t.get('status','pending')
+        if s in ('pending','running','done','failed'):
+            c[s] += 1
+        else:
+            c['other'] += 1
+for k in ('pending','running','done','failed','other'):
+    print(f"{k}={c.get(k,0)}")
 PY
 }
 
@@ -177,7 +204,7 @@ PY
 
 tasks_max_wave() {
   _require_tasks_file || return 1
-  python3 - "$SPEC_LOOP_TASKS" <<'PY'
+  python3 - "$SPEC_LOOP_TASKS" <<'PY' | _strip_cr
 import json, sys
 with open(sys.argv[1]) as f:
     d = json.load(f)
