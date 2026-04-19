@@ -179,73 +179,15 @@ case "$PHASE" in
     ;;
 
   implementing)
+    # v0.4: tests-first. After codex impl finishes we go directly to L1
+    # testing — no separate reviewing / addressing phase, no codex review
+    # step. Run-tests.sh is the gate; a failing suite triggers a replan.
     ensure_inner_dir
-    INNER_DIR=$(current_inner_dir)
-    log_info "Phase=implementing -> spawning Codex review"
-
-    if bash "${PLUGIN_ROOT}/scripts/run-codex-review.sh" "$INNER_DIR" >> "$SPEC_LOOP_LOG" 2>&1; then
-      state_set phase reviewing
-      cat >&2 <<EOF
-[spec-loop L2] Codex review complete. See: ${INNER_DIR}/codex-review.md
-
-Please now:
-1. Read the review output
-2. Consult the \`review-analyst\` agent to decide if changes have converged or need another iteration
-3. If iterating: make fixes, then the loop will trigger another review when you finish
-
-When you respond, update the state via:
-  bash -c 'source "${PLUGIN_ROOT}/scripts/lib-state.sh" && state_set phase addressing'
-EOF
-      exit 2
-    else
-      log_error "Codex review failed"
-      cat >&2 <<EOF
-[spec-loop] Codex review invocation failed. Check ${SPEC_LOOP_LOG}.
-You may continue manually or run /spec-cancel to abort.
-EOF
-      exit 2
-    fi
-    ;;
-
-  reviewing|addressing)
-    INNER_DIR=$(current_inner_dir)
-    DECISION_FILE="${INNER_DIR}/decision.json"
-
-    if [[ -f "$DECISION_FILE" ]]; then
-      CONVERGED=$(json_bool_field "$DECISION_FILE" converged)
-
-      if [[ "$CONVERGED" == "true" ]]; then
-        log_info "Converged. Transitioning to testing phase."
-        state_set phase testing testing_phase_nudges 0
-        cat >&2 <<EOF
-[spec-loop L2] Inner loop converged (iter=$INNER). Transitioning to L1 testing.
-Next: run the test suite for the outer-loop gate.
-  bash ${PLUGIN_ROOT}/scripts/run-tests.sh
-EOF
-        exit 2
-      else
-        NEXT=$((INNER + 1))
-        state_set phase implementing inner_iter "$NEXT"
-        log_info "Not converged; starting inner iter=$NEXT"
-        cat >&2 <<EOF
-[spec-loop L2] Inner iter $INNER not converged. Starting iter=$NEXT.
-Please continue addressing the review findings.
-Review:   ${INNER_DIR}/codex-review.md
-Analysis: ${INNER_DIR}/claude-analysis.md
-EOF
-        exit 2
-      fi
-    fi
-
-    # No decision file yet
+    log_info "Phase=implementing -> transitioning to L1 testing"
+    state_set phase testing testing_phase_nudges 0
     cat >&2 <<EOF
-[spec-loop L2] Claude must decide convergence before stopping.
-
-Consult the \`convergence-judge\` agent and write:
-  ${DECISION_FILE}
-with schema: {"converged": bool, "reasoning": "...", "remaining_issues": [...]}
-
-Then stop again; this hook will take over.
+[spec-loop L2] Implementation complete. Next: run the test gate.
+  bash ${PLUGIN_ROOT}/scripts/run-tests.sh
 EOF
     exit 2
     ;;

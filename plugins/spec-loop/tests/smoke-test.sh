@@ -153,80 +153,11 @@ check_eq   "setup detected crud"      "$(state_get scenario)" "crud"
 check_eq   "setup phase=planning"     "$(state_get phase)"    "planning"
 
 # -----------------------------------------------------------
-# 5. run-codex-review.sh fallback (codex absent)
+# 5. run-tests.sh framework detection (v0.4: review steps removed)
 # -----------------------------------------------------------
-echo "[5/8] run-codex-review.sh (fallback path)"
+echo "[5/6] run-tests.sh framework detection"
 INNER_DIR="${SPEC_LOOP_ITER_DIR}/outer-001/inner/iter-000"
 mkdir -p "$INNER_DIR"
-echo "Fake task: do a thing" > "$INNER_DIR/task.md"
-state_set current_task "$INNER_DIR/task.md"
-echo "change" > "$SMOKE_DIR/file.txt"
-
-if command -v codex >/dev/null 2>&1; then
-  echo -e "  ${YELLOW}○${RESET} codex is system-installed; skipping fallback-path check (would actually call Codex)"
-else
-  bash "${PLUGIN_ROOT}/scripts/run-codex-review.sh" "$INNER_DIR" >/dev/null 2>&1 || true
-  check_file "review file created (fallback)" "$INNER_DIR/codex-review.md"
-  check_file "diff.patch captured"            "$INNER_DIR/diff.patch"
-fi
-
-# -----------------------------------------------------------
-# 6. analyze-review.sh parser
-# -----------------------------------------------------------
-echo "[6/8] analyze-review.sh"
-cat > "$INNER_DIR/codex-review.md" <<'EOF'
-# Review
-
-BLOCKING: missing input validation — src/routes/users.js:12
-  Rationale: Empty body crashes the handler.
-  Fix: validate with zod.
-
-IMPORTANT: no 404 test — tests/users.test.js
-  Rationale: happy path only.
-  Fix: add a GET missing-user test.
-
-NIT: variable name inconsistency — src/routes/users.js:24
-
-VERDICT: NEEDS_CHANGES
-EOF
-
-bash "${PLUGIN_ROOT}/scripts/analyze-review.sh" "$INNER_DIR" >/dev/null
-check_file "summary.json created" "$INNER_DIR/review-summary.json"
-
-# Read JSON via argv (so MSYS/cygwin can path-translate for native Windows
-# Python; inline -c strings are not translated).
-_json_field() { python3 - "$1" "$2" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-keys = sys.argv[2].split('.')
-v = d
-for k in keys:
-    v = v[k]
-print(v)
-PY
-}
-
-VERDICT=$(_json_field "$INNER_DIR/review-summary.json" verdict)
-BLOCKING_COUNT=$(_json_field "$INNER_DIR/review-summary.json" counts.blocking)
-HARD_CONV=$(_json_field "$INNER_DIR/review-summary.json" hard_converged)
-check_eq "parsed verdict=NEEDS_CHANGES" "$VERDICT"        "NEEDS_CHANGES"
-check_eq "blocking count = 1"           "$BLOCKING_COUNT" "1"
-check_eq "hard_converged = False"       "$HARD_CONV"      "False"
-
-# APPROVED path
-cat > "$INNER_DIR/codex-review.md" <<'EOF'
-# Review
-Looks good.
-VERDICT: APPROVED
-EOF
-bash "${PLUGIN_ROOT}/scripts/analyze-review.sh" "$INNER_DIR" >/dev/null
-HARD_CONV2=$(_json_field "$INNER_DIR/review-summary.json" hard_converged)
-check_eq "APPROVED → hard_converged=True" "$HARD_CONV2" "True"
-
-# -----------------------------------------------------------
-# 7. run-tests.sh framework detection
-# -----------------------------------------------------------
-echo "[7/8] run-tests.sh framework detection"
 state_set phase testing outer_iter 1 inner_iter 0
 OUTER_DIR="${SPEC_LOOP_ITER_DIR}/outer-001"
 mkdir -p "$OUTER_DIR"
@@ -372,67 +303,9 @@ else
   FAIL_COUNT=$((FAIL_COUNT + 1))
 fi
 
-# 10b. Large-diff cap in run-codex-review.sh
-state_init "smoke-bigdiff"
-state_set phase implementing outer_iter 1 inner_iter 0 current_task "$(pwd)/fake-task.md"
-echo "Do a thing" > "$SMOKE_DIR/fake-task.md"
-# Make a >200KB diff
-python3 - "$SMOKE_DIR/bigfile.txt" <<'PY' 2>/dev/null || true
-import sys
-with open(sys.argv[1], 'w') as f:
-    f.write('A' * 300000)
-PY
-cd "$SMOKE_DIR" && git add bigfile.txt && git commit -qm big 2>/dev/null || true
-# Modify it to create a diff
-echo "diff change" >> "$SMOKE_DIR/bigfile.txt"
-
-BIG_INNER="${SPEC_LOOP_ITER_DIR}/outer-001/inner/iter-000"
-mkdir -p "$BIG_INNER"
-echo "Fake task" > "$BIG_INNER/task.md"
-state_set current_task "$BIG_INNER/task.md"
-
-# Run review (codex absent on this env → fallback path, but diff-size logic still runs)
-bash "${PLUGIN_ROOT}/scripts/run-codex-review.sh" "$BIG_INNER" >/dev/null 2>&1 || true
-if [[ -f "$BIG_INNER/diff.patch" ]]; then
-  DIFF_ORIG_BYTES=$(wc -c < "$BIG_INNER/diff.patch" | tr -d ' ')
-  check_file "big-diff captured"                     "$BIG_INNER/diff.patch"
-  if (( DIFF_ORIG_BYTES > 204800 )); then
-    check_file "big-diff truncated file present"     "$BIG_INNER/diff.patch.truncated"
-    TRUNC_BYTES=$(wc -c < "$BIG_INNER/diff.patch.truncated" | tr -d ' ')
-    if (( TRUNC_BYTES <= 205000 )); then
-      echo -e "  ${GREEN}✓${RESET} truncated diff <= 205KB (actual: $TRUNC_BYTES)"
-      PASS_COUNT=$((PASS_COUNT + 1))
-    else
-      echo -e "  ${RED}✗${RESET} truncated diff too large: $TRUNC_BYTES"
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-    fi
-  else
-    echo -e "  ${YELLOW}○${RESET} diff was smaller than cap ($DIFF_ORIG_BYTES); truncation path not exercised"
-  fi
-else
-  echo -e "  ${RED}✗${RESET} run-codex-review.sh didn't capture diff.patch"
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-fi
-
-# 10c. Heredoc-exec safety: task.md containing $(PWNED) must NOT be executed
-state_init "smoke-heredoc"
-PWN_DIR="${SPEC_LOOP_ITER_DIR}/outer-001/inner/iter-000"
-mkdir -p "$PWN_DIR"
-cat > "$PWN_DIR/task.md" <<'EOF'
-This task includes: $(touch /tmp/SPEC_LOOP_PWN_MARKER_XYZ)
-And backticks: `touch /tmp/SPEC_LOOP_PWN_BACKTICK_XYZ`
-EOF
-rm -f /tmp/SPEC_LOOP_PWN_MARKER_XYZ /tmp/SPEC_LOOP_PWN_BACKTICK_XYZ
-state_set phase implementing outer_iter 1 inner_iter 0 current_task "$PWN_DIR/task.md"
-bash "${PLUGIN_ROOT}/scripts/run-codex-review.sh" "$PWN_DIR" >/dev/null 2>&1 || true
-if [[ ! -f /tmp/SPEC_LOOP_PWN_MARKER_XYZ && ! -f /tmp/SPEC_LOOP_PWN_BACKTICK_XYZ ]]; then
-  echo -e "  ${GREEN}✓${RESET} heredoc command-injection attempts blocked"
-  PASS_COUNT=$((PASS_COUNT + 1))
-else
-  echo -e "  ${RED}✗${RESET} HEREDOC INJECTION WORKED — shell executed \$(...) or backticks"
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  rm -f /tmp/SPEC_LOOP_PWN_MARKER_XYZ /tmp/SPEC_LOOP_PWN_BACKTICK_XYZ
-fi
+# (v0.4: removed 10b large-diff-cap, 10c heredoc-exec safety, which exercised
+#  run-codex-review.sh. The script was deleted in v0.4 — review is now
+#  slice-based and lives in run-global-review.sh.)
 
 # 10d. Testing-phase nudge counter: N+1 stops with no tests → phase=failed
 state_init "smoke-stuck"

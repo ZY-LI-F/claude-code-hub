@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
-# run-global-review.sh - Whole-repo review round, using codex as reviewer.
-# Produces: .spec-loop/global/round-<N>/codex-review.md  + diff.patch
-# Updates state: reads global_round; caller is responsible for bumping.
+# run-global-review.sh (v0.4) - Slice-based whole-project review.
 #
-# Usage: run-global-review.sh
+# Instead of a single 200 KB+ prompt that asks codex for a VERDICT, we
+# fire multiple small codex invocations (one per "slice"), each with a
+# narrow focus and a structured-JSON output contract. Claude's
+# global-review-analyst agent then reads all findings-*.json and produces
+# the final decision.json.
+#
+# Slices (v0.4 default):
+#   - api-contracts   : router files + service signatures, look for drift
+#   - ui-integration  : web/ imports + route wiring, unused exports
+#   - test-coverage   : tests/ vs server/ / web/ directory parity
+#   - security        : hard-coded secrets, unsafe defaults, missing auth
+#
+# For each slice we pass codex:
+#   - a tight 20 KB snippet (the slice-relevant diff + a file list)
+#   - a "STRICT OUTPUT: one JSON object" system rule
+#   - reasoning effort medium, model gpt-5-codex-mini when available (falls
+#     back to the session default on error)
+#
+# Writes: .spec-loop/global/round-NNN/findings-<slice>.json
 
 set -uo pipefail
 
@@ -16,168 +32,160 @@ ROUND=$(state_get global_round); ROUND=${ROUND:-1}
 ROUND_DIR=$(printf '%s/round-%03d' "$SPEC_LOOP_GLOBAL_DIR" "$ROUND")
 mkdir -p "$ROUND_DIR"
 
-# Base for the diff: the commit recorded when multi-mode was set up, or HEAD~
 BASE=$(state_get multi_base_commit)
 if [[ -z "$BASE" ]]; then
   BASE=$(cd "$CLAUDE_PROJECT_DIR" && git rev-list --max-parents=0 HEAD | head -1)
 fi
 
+# Unfiltered full diff (audit trail)
 DIFF_FILE="$ROUND_DIR/diff.patch"
 ( cd "$CLAUDE_PROJECT_DIR" && git diff "$BASE" HEAD ) > "$DIFF_FILE" 2>/dev/null || true
 
-# v0.3: cap at 50 KB (was 200 KB). Codex drifts into essay mode on huge
-# prompts; forcing a compact diff keeps the review focused on top-level
-# integration risks rather than line-by-line nitpicking.
-DIFF_CAP="${SPEC_LOOP_GLOBAL_DIFF_CAP:-51200}"
-DIFF_SNIPPET=$(head -c "$DIFF_CAP" "$DIFF_FILE")
-DIFF_BYTES=$(wc -c < "$DIFF_FILE" | tr -d ' ')
+# Per-slice diff cap — keep prompts small to stop codex drifting into essay mode.
+: "${SPEC_LOOP_SLICE_DIFF_CAP:=20480}"   # 20 KB per slice
+: "${SPEC_LOOP_REVIEW_MODEL:=}"          # optional override, e.g. gpt-5-codex-mini
+: "${SPEC_LOOP_REVIEW_REASONING:=medium}"
 
-PROMPT_FILE="$ROUND_DIR/review-prompt.md"
-REVIEW_FILE="$ROUND_DIR/codex-review.md"
-
-cat > "$PROMPT_FILE" <<EOF
-# Whole-Project Review (round $ROUND)
-
-**Output format is hard-enforced. Ignore it and this round is wasted.**
-
-The FIRST THREE LINES of your response MUST be:
-
-\`\`\`
-VERDICT: APPROVED
-SUMMARY: <one-sentence summary>
-FINDINGS: <n>
-\`\`\`
-
-or, if there are any blocking issues:
-
-\`\`\`
-VERDICT: NEEDS_CHANGES
-SUMMARY: <one-sentence summary>
-FINDINGS: <n>
-\`\`\`
-
-Then list findings (one per block, at most 10). Do NOT write prose essays
-about software methodology, complexity transfer, or team roles — this is a
-code review, keep it mechanical.
-
-You are the *senior* reviewer for an entire multi-task delivery. Many atomic
-tasks have been merged into the main branch; now judge the result as a whole.
-
-## Spec (original requirement)
-
-$(cat "$SPEC_LOOP_SPEC" 2>/dev/null || echo "(spec.md missing)")
-
-## Plan
-
-$(cat "$SPEC_LOOP_PLAN" 2>/dev/null || echo "(plan.md missing)")
-
-## Completed tasks
-
-$(python3 - "$SPEC_LOOP_TASKS" 2>/dev/null <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    for t in d.get('tasks', []):
-        print(f"- {t['id']} [{t.get('status','?')}] {t.get('title','')}")
-except Exception:
-    print("(tasks.json missing)")
-PY
-)
-
-## Diff (size: $DIFF_BYTES bytes, truncated to first $DIFF_CAP if larger)
-
-\`\`\`diff
-$DIFF_SNIPPET
-\`\`\`
-
-## Review scope
-
-Focus on integration issues that single-task reviews cannot see:
-1. **Cross-task consistency**: API contracts, shared types, naming, dependency versions.
-2. **Data-flow correctness**: state, concurrency, error propagation across boundaries.
-3. **Missing wiring**: unused exports, orphaned modules, dead endpoints, disabled tests.
-4. **Security regressions**: leaked secrets, unsafe defaults, auth gaps.
-5. **Tests**: total coverage gaps, flaky patterns, tests that only pass in isolation.
-
-## Findings block format
-
-Recap: start with the 3-line header above. For each finding use:
-
-\`\`\`
-<SEVERITY>: <title> — <file:line>
-  Rationale: one sentence.
-  Fix: one sentence.
-\`\`\`
-
-Severities: BLOCKING, IMPORTANT, NIT. Max 10 findings total. Prefer
-elevating the most important 3-5; skip cosmetic nits entirely.
-
-The header you already wrote (VERDICT / SUMMARY / FINDINGS) is the source
-of truth for the harness — do not change it, do not echo it at the bottom.
-EOF
-
-if ! command -v codex >/dev/null 2>&1; then
-  log_error "codex CLI missing for global review"
-  echo "VERDICT: NEEDS_CHANGES" > "$REVIEW_FILE"
-  echo "BLOCKING: codex CLI not installed" >> "$REVIEW_FILE"
-  exit 1
-fi
-
-log_info "run-global-review[$ROUND]: invoking codex"
-_invoke_codex() {
-  local out="$1"
-  # shellcheck disable=SC2086
-  codex exec $SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check - \
-    < "$PROMPT_FILE" > "$out" 2>&1
+_slice_diff() {
+  # Usage: _slice_diff <slice_name> > file
+  # Produces a size-capped diff limited to path globs that matter for the slice.
+  local slice="$1"
+  local pathspecs=()
+  case "$slice" in
+    api-contracts)  pathspecs=( 'server/routers/*' 'server/services/*' 'server/repos/*' ) ;;
+    ui-integration) pathspecs=( 'web/src/routes/*' 'web/src/features/*' 'web/src/components/*' 'web/src/stores/*' 'web/src/lib/*' ) ;;
+    test-coverage)  pathspecs=( 'tests/*' 'web/src/**/__tests__/*' 'web/vitest.config.ts' ) ;;
+    security)       pathspecs=( 'server/*' 'configs/*' '*.env*' '*.gitignore' ) ;;
+    *)              pathspecs=( '.' ) ;;
+  esac
+  ( cd "$CLAUDE_PROJECT_DIR" && git diff "$BASE" HEAD -- "${pathspecs[@]}" ) 2>/dev/null | head -c "$SPEC_LOOP_SLICE_DIFF_CAP"
 }
 
-if ! _invoke_codex "$REVIEW_FILE"; then
-  log_warn "run-global-review[$ROUND]: codex exec failed (rc=$?); assuming NEEDS_CHANGES"
-  echo "VERDICT: NEEDS_CHANGES" >> "$REVIEW_FILE"
-fi
+_slice_prompt() {
+  local slice="$1" diff_snippet="$2" prompt_file="$3"
+  cat > "$prompt_file" <<EOF
+You are performing a FOCUSED review on slice: "$slice".
 
-# Drift detection: if codex produced no VERDICT header in the first 20 lines,
-# it probably wandered off into essay mode. Try once more with a much
-# shorter prompt that re-emphasises the output contract.
-if ! head -20 "$REVIEW_FILE" | grep -qE '^VERDICT:\s*(APPROVED|NEEDS_CHANGES)'; then
-  log_warn "run-global-review[$ROUND]: no VERDICT in first 20 lines; retrying with strict prompt"
-  cat > "$PROMPT_FILE.retry" <<EOF
-STRICT MODE. Your reply MUST start with exactly these three lines:
+STRICT OUTPUT CONTRACT. Reply with exactly ONE JSON object and NOTHING ELSE:
 
-VERDICT: APPROVED
-SUMMARY: <one sentence>
-FINDINGS: 0
+{
+  "slice": "$slice",
+  "summary": "one short sentence",
+  "findings": [
+    {
+      "severity": "BLOCKING" | "IMPORTANT" | "NIT",
+      "title": "short noun phrase",
+      "location": "path/to/file.ext:line or module",
+      "rationale": "one sentence, concrete, cites the diff",
+      "fix": "one sentence, concrete action"
+    }
+  ]
+}
 
-or if there are issues:
+Rules:
+- Max 5 findings. If nothing found, return an empty "findings" array.
+- Do NOT emit any prose outside the JSON object. No markdown fences.
+- Do NOT write a VERDICT — that's Claude's job, not yours.
+- Be strict about REAL bugs (contract drift, dead wiring, leaked secrets).
+  Skip stylistic nits; they just waste the triage budget.
 
-VERDICT: NEEDS_CHANGES
-SUMMARY: <one sentence>
-FINDINGS: <count>
+## Spec (trimmed)
 
-followed by up to 10 structured findings in the format:
+$(head -c 2048 "$SPEC_LOOP_SPEC" 2>/dev/null)
 
-<SEVERITY>: <title> — <file:line>
-  Rationale: ...
-  Fix: ...
+## Diff scoped to slice "$slice" (up to $SPEC_LOOP_SLICE_DIFF_CAP bytes)
 
-Do NOT write any other prose. Here is the change summary you are judging:
-
-## Spec
-$(cat "$SPEC_LOOP_SPEC" 2>/dev/null | head -c 4096)
-
-## Diff (first 30 KB)
 \`\`\`diff
-$(head -c 30720 "$DIFF_FILE")
+$diff_snippet
 \`\`\`
 EOF
-  mv "$REVIEW_FILE" "$REVIEW_FILE.drift"
-  if codex exec $SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check - \
-         < "$PROMPT_FILE.retry" > "$REVIEW_FILE" 2>&1; then
-    log_info "run-global-review[$ROUND]: strict retry complete"
-  else
-    log_error "run-global-review[$ROUND]: strict retry also failed"
-    echo "VERDICT: NEEDS_CHANGES" >> "$REVIEW_FILE"
-  fi
-fi
+}
 
-echo "Global review round $ROUND -> $REVIEW_FILE"
+_invoke_codex_slice() {
+  # Usage: _invoke_codex_slice <slice>
+  local slice="$1"
+  local prompt="$ROUND_DIR/review-prompt-${slice}.md"
+  local out="$ROUND_DIR/findings-${slice}.json"
+  local raw="$ROUND_DIR/codex-raw-${slice}.log"
+  local diff_body
+  diff_body=$(_slice_diff "$slice")
+
+  _slice_prompt "$slice" "$diff_body" "$prompt"
+
+  if ! command -v codex >/dev/null 2>&1; then
+    log_error "codex CLI missing for global review slice=$slice"
+    printf '{"slice":"%s","summary":"codex CLI not installed","findings":[]}' "$slice" > "$out"
+    return 0
+  fi
+
+  local flags="$SPEC_LOOP_CODEX_FLAGS --skip-git-repo-check"
+  [[ -n "$SPEC_LOOP_REVIEW_MODEL" ]] && flags="$flags --model $SPEC_LOOP_REVIEW_MODEL"
+  # shellcheck disable=SC2086
+  if ! codex exec $flags - < "$prompt" > "$raw" 2>&1; then
+    log_warn "run-global-review[$ROUND/$slice]: codex exec failed (rc=$?); emitting empty findings"
+    printf '{"slice":"%s","summary":"codex exec failed","findings":[]}' "$slice" > "$out"
+    return 0
+  fi
+
+  # Extract the first JSON object found in the raw output.
+  _py3 - "$raw" "$out" "$slice" <<'PY'
+import json, re, sys
+raw_path, out_path, slice_name = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    text = open(raw_path, encoding='utf-8', errors='replace').read()
+except Exception:
+    text = ""
+match = None
+# Cheap extract: first { ... } block with "slice" key
+for m in re.finditer(r'\{', text):
+    start = m.start()
+    depth = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == '{': depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i+1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict) and 'slice' in obj and 'findings' in obj:
+                        match = obj
+                        break
+                except Exception:
+                    pass
+                break
+    if match:
+        break
+if not match:
+    match = {"slice": slice_name, "summary": "could not parse codex output as JSON",
+             "findings": []}
+json.dump(match, open(out_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+}
+
+# Default slice set (overridable via env)
+: "${SPEC_LOOP_REVIEW_SLICES:=api-contracts ui-integration test-coverage security}"
+
+log_info "run-global-review[$ROUND]: slices=$SPEC_LOOP_REVIEW_SLICES"
+for slice in $SPEC_LOOP_REVIEW_SLICES; do
+  log_info "run-global-review[$ROUND]: slice=$slice starting"
+  _invoke_codex_slice "$slice"
+done
+
+# Aggregate index so analyst only needs one read
+AGG="$ROUND_DIR/findings.json"
+_py3 - "$ROUND_DIR" "$AGG" <<'PY'
+import json, os, sys, glob
+round_dir, agg_path = sys.argv[1], sys.argv[2]
+slices = []
+for path in sorted(glob.glob(os.path.join(round_dir, 'findings-*.json'))):
+    try:
+        slices.append(json.load(open(path, encoding='utf-8')))
+    except Exception as e:
+        slices.append({"slice": os.path.basename(path), "summary": f"parse error: {e}", "findings": []})
+json.dump({"round_dir": round_dir, "slices": slices}, open(agg_path, 'w', encoding='utf-8'),
+          ensure_ascii=False, indent=2)
+PY
+
+echo "Global review round $ROUND: $(ls "$ROUND_DIR"/findings-*.json 2>/dev/null | wc -l | tr -d ' ') slice findings files"
+echo "Aggregate: $AGG"

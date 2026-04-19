@@ -12,7 +12,7 @@
 #   - worktree      cwd for codex (falls back to CLAUDE_PROJECT_DIR)
 #
 # Writes under $(task_dir <task_id>):
-#   task-state.json      {iter, last_verdict, status, ...}
+#   task-state.json      {iter, status, ...}
 #   iter-000/
 #     impl-prompt.md, codex-impl.log, diff.patch
 #     review-prompt.md, codex-review.md
@@ -56,7 +56,7 @@ if [[ ! -f "$TASK_STATE" ]]; then
   python3 - "$TASK_STATE" "$TASK_ID" <<'PY'
 import json, sys, datetime
 path, tid = sys.argv[1], sys.argv[2]
-d = {"id": tid, "iter": 0, "status": "running", "last_verdict": "",
+d = {"id": tid, "iter": 0, "status": "running",
      "created_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
 with open(path, 'w') as f: json.dump(d, f, indent=2)
 PY
@@ -116,68 +116,34 @@ $(if [[ -n "$prev_review" ]]; then echo "$prev_review"; else echo "(first iterat
 EOF
 }
 
-_build_review_prompt() {
-  local iter_dir="$1"
-  local diff
-  diff=$(cd "$CWD" && git diff HEAD~1..HEAD 2>/dev/null | head -c "$DIFF_CAP")
-  [[ -z "$diff" ]] && diff=$(cd "$CWD" && git diff HEAD 2>/dev/null | head -c "$DIFF_CAP")
-  cat > "$iter_dir/review-prompt.md" <<EOF
-# Code Review (multi-task mode)
-
-You are an independent reviewer for a single parallel task. Be strict and
-concrete. Review only the diff below against the task spec.
-
-## Task
-
-$(cat "$TASK_MD")
-
-## Diff
-
-\`\`\`diff
-$diff
-\`\`\`
-
-## Output format
-
-For each finding, use this block:
-\`\`\`
-<SEVERITY>: <title> — <file:line>
-  Rationale: ...
-  Fix: ...
-\`\`\`
-Severities: BLOCKING, IMPORTANT, NIT.
-
-End with exactly one line: \`VERDICT: APPROVED\` or \`VERDICT: NEEDS_CHANGES\`.
-EOF
-}
-
 _build_fix_prompt() {
-  local iter_dir="$1" prev_review_file="$2"
-  # Cap the prior review to keep codex input under its 1MB limit.
-  local review_body
-  review_body=$(head -c 50000 "$prev_review_file")
+  # v0.4: fix prompt uses the task's test-output.log as the ONLY context,
+  # not a codex review. Tests are the truth source; a reviewer LLM rephrasing
+  # failures just adds latency + false positives (see POST-MORTEM-v0.2.md B1/B2).
+  local iter_dir="$1" prev_test_log="$2"
+  local test_body
+  test_body=$(head -c 50000 "$prev_test_log" 2>/dev/null || echo "(no prior test output)")
   cat > "$iter_dir/impl-prompt.md" <<EOF
-# Task Fix Iteration (multi-task mode)
+# Task Fix Iteration
 
-Same working directory / task as before. Address the findings in the prior
-review. If your change affects the task's test surface, re-run the task's
-test command before committing.
+Same working directory / task as before. The previous attempt's tests
+FAILED. Read the test output below, identify the root cause, and fix it.
+Keep changes minimal — do not refactor unrelated code.
 
 ## Task
 
 $(cat "$TASK_MD")
 
-## Prior review (truncated to 50 KB if longer)
+## Prior test output (truncated to 50 KB if longer)
 
-$review_body
+\`\`\`
+$test_body
+\`\`\`
 
 ## Rules
-- Minimal fix; don't refactor unrelated code.
+- Make only the changes needed to make those tests pass.
 - Commit with message prefix \`[spec-loop] $TASK_ID fix: ...\`.
 - **Do NOT** edit \`.spec-loop/\` files.
-- If you think a reviewer finding is stylistic/architectural rather than a
-  correctness bug and the test suite already covers the intended behaviour,
-  note it in \`$iter_dir/deferred.md\` and move on.
 EOF
 }
 
@@ -191,13 +157,12 @@ while (( ITER < MAX_INNER )); do
   _task_state_set iter "$ITER" status running
 
   # ---- Step 1: implement / fix ----
-  PREV_REVIEW=""
   PREV_ITER=$((ITER - 1))
-  PREV_REVIEW_FILE="$TASK_DIR/iter-$(printf '%03d' "$PREV_ITER")/codex-review.md"
+  PREV_TEST_LOG="$TASK_DIR/iter-$(printf '%03d' "$PREV_ITER")/test-output.log"
   if (( ITER == 0 )); then
     _build_impl_prompt "$ITER_DIR" ""
-  elif [[ -f "$PREV_REVIEW_FILE" ]]; then
-    _build_fix_prompt "$ITER_DIR" "$PREV_REVIEW_FILE"
+  elif [[ -f "$PREV_TEST_LOG" ]]; then
+    _build_fix_prompt "$ITER_DIR" "$PREV_TEST_LOG"
   else
     _build_impl_prompt "$ITER_DIR" ""
   fi
@@ -231,56 +196,31 @@ while (( ITER < MAX_INNER )); do
   # Capture the diff for the record
   ( cd "$CWD" && git diff HEAD~1..HEAD 2>/dev/null || git diff HEAD 2>/dev/null ) > "$ITER_DIR/diff.patch" || true
 
-  # ---- Step 2: test FIRST — objective convergence signal ----
-  TESTS_PASSED="unknown"
-  if [[ -n "$TEST_CMD" ]]; then
-    ( cd "$CWD" && timeout "$TIMEOUT_SEC" bash -c "$TEST_CMD" ) > "$ITER_DIR/test-output.log" 2>&1
-    TRC=$?
-    python3 - "$ITER_DIR/test-results.json" "$TRC" "$TEST_CMD" <<'PY'
+  # ---- Step 2: test — the only convergence signal (v0.4) ----
+  if [[ -z "$TEST_CMD" ]]; then
+    # No test command configured — codex finished, assume done.
+    log_info "run-task-loop[$TASK_ID] iter=$ITER: no test command; codex done -> task done"
+    _task_state_set status done
+    tasks_update "$TASK_ID" status done inner_iter "$ITER" completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    exit 0
+  fi
+
+  ( cd "$CWD" && timeout "$TIMEOUT_SEC" bash -c "$TEST_CMD" ) > "$ITER_DIR/test-output.log" 2>&1
+  TRC=$?
+  python3 - "$ITER_DIR/test-results.json" "$TRC" "$TEST_CMD" <<'PY'
 import json, sys
 path, rc, cmd = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 json.dump({"passed": rc == 0, "exit_code": rc, "command": cmd}, open(path, 'w'), indent=2)
 PY
-    TESTS_PASSED=$([[ $TRC -eq 0 ]] && echo "true" || echo "false")
-  fi
 
-  # ---- Step 3: review (always run for the record) ----
-  _build_review_prompt "$ITER_DIR"
-  if ! _run_codex "$ITER_DIR/review-prompt.md" "$ITER_DIR/codex-review.md"; then
-    log_warn "run-task-loop[$TASK_ID] iter=$ITER: codex review failed; assuming NEEDS_CHANGES"
-    echo "VERDICT: NEEDS_CHANGES" > "$ITER_DIR/codex-review.md"
-  fi
-
-  VERDICT="NEEDS_CHANGES"
-  if grep -qE '^VERDICT:\s*APPROVED' "$ITER_DIR/codex-review.md"; then
-    VERDICT="APPROVED"
-  fi
-  _task_state_set last_verdict "$VERDICT"
-
-  # ---- Step 4: convergence decision ----
-  # Priority 1: if tests pass, task is done. Review findings (if any) are
-  # deferred to the global-review phase — that is exactly what it exists for.
-  if [[ "$TESTS_PASSED" == "true" ]]; then
-    log_info "run-task-loop[$TASK_ID] iter=$ITER: tests PASS -> done (verdict=$VERDICT)"
-    if [[ "$VERDICT" == "NEEDS_CHANGES" ]]; then
-      cp "$ITER_DIR/codex-review.md" "$ITER_DIR/deferred-review.md" 2>/dev/null || true
-    fi
+  if (( TRC == 0 )); then
+    log_info "run-task-loop[$TASK_ID] iter=$ITER: tests PASS -> done"
     _task_state_set status done
     tasks_update "$TASK_ID" status done inner_iter "$ITER" completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     exit 0
   fi
 
-  # Priority 2: no test command + review approved → done
-  if [[ -z "$TEST_CMD" && "$VERDICT" == "APPROVED" ]]; then
-    log_info "run-task-loop[$TASK_ID] iter=$ITER: APPROVED, no test command -> done"
-    _task_state_set status done
-    tasks_update "$TASK_ID" status done inner_iter "$ITER" completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    exit 0
-  fi
-
-  # Tests failing (or no tests and NEEDS_CHANGES): iterate.
-  log_warn "run-task-loop[$TASK_ID] iter=$ITER: tests=$TESTS_PASSED verdict=$VERDICT, continuing loop"
-
+  log_warn "run-task-loop[$TASK_ID] iter=$ITER: tests FAIL (rc=$TRC), iterating"
   ITER=$((ITER + 1))
 done
 

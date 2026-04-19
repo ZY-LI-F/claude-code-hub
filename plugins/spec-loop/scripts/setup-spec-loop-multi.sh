@@ -56,6 +56,11 @@ tasks_init_empty
 
 mkdir -p "$SPEC_LOOP_BATCHES_DIR" "$SPEC_LOOP_GLOBAL_DIR"
 
+# v0.4: intent-to-add untracked files so subsequent `git diff HEAD` snapshots
+# see them (fixes the long-standing "BLOCKING: file X not implemented" false
+# positives that made per-task review useless in v0.2/v0.3).
+( cd "$CLAUDE_PROJECT_DIR" && git add -N -A -- ':!.spec-loop' 2>/dev/null ) || true
+
 log_info "setup-spec-loop-multi: session=$SESSION_ID scenario=$SCENARIO base=$BASE"
 cat <<EOF
 [spec-loop] multi-mode initialized.

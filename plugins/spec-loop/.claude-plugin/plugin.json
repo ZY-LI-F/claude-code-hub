@@ -1,6 +1,6 @@
 {
   "name": "spec-loop",
-  "version": "0.3.0",
-  "description": "Spec-driven nested loop. v0.3: tests-first convergence, multi-signal codex-done detection, auto-advance waves + auto-rescue failed tasks, cherry-pick merge fallback, strict global-review prompt with drift retry, new /spec-rebind + /spec-resume commands. v0.2 multi-mode entry /spec-loop:multi-start preserved.",
+  "version": "0.4.0",
+  "description": "Spec-driven nested loop. v0.4: fully tests-first — drops the per-task codex review step (tests are the only convergence gate). Global review is now slice-based: codex produces structured JSON findings per slice (api-contracts / ui-integration / test-coverage / security), Claude's global-review-analyst decides. Auto git add -N on setup eliminates the diff false-positive class. Command surface unchanged (7 /spec-loop:* commands).",
   "author": { "name": "spec-loop contributors" }
 }

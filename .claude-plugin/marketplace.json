@@ -7,8 +7,8 @@
   "plugins": [
     {
       "name": "spec-loop",
-      "description": "Nested-loop coding harness. v0.3: tests-first convergence + auto-rescue + cherry-pick merge fallback + auto-advance waves + strict global-review prompt. v0.2 multi-task mode preserved.",
-      "version": "0.3.0",
+      "description": "Nested-loop coding harness. v0.4: fully tests-first (drop per-task codex review); slice-based global review with structured JSON findings; auto git add -N on setup. Same 7 /spec-loop:* commands.",
+      "version": "0.4.0",
       "source": "./plugins/spec-loop",
       "category": "development",
       "homepage": "https://github.com/ZY-LI-F/claude-code-hub"

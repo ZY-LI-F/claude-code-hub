@@ -46,6 +46,12 @@ state_set phase planning scenario "$SCENARIO" outer_iter 1 inner_iter 0
 # Initial outer iter dir
 mkdir -p "$(current_outer_dir)"
 
+# v0.4: intent-to-add untracked files so subsequent `git diff HEAD` snapshots
+# see them. Without this, the global-review slice diffs (and any downstream
+# review consumer) can't see codex's newly-created files — the classic
+# "BLOCKING: file X not implemented" false positive from v0.2/v0.3.
+( cd "$CLAUDE_PROJECT_DIR" && git add -N -A -- ':!.spec-loop' 2>/dev/null ) || true
+
 log_info "Spec-loop initialized: session=$SESSION_ID scenario=$SCENARIO"
 
 cat <<EOF

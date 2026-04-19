@@ -42,13 +42,17 @@ You are starting a **spec-loop**: a nested-loop harness where you are the orches
 
 6. **Stop**. When you finish this turn, the **Stop hook** fires and will automatically trigger a Codex review. You'll be woken up again to address the feedback. Don't try to run the review yourself — let the hook do it.
 
-## Loop contract (read carefully)
+## Loop contract (v0.4, tests-first)
 
-The Stop hook manages the L2 inner loop. On each wake-up it will tell you what phase you're in and what it expects next. Your obligations:
+The Stop hook manages the outer loop. v0.4 drops the intermediate
+Codex review step: after codex finishes implementing, the hook sends
+you straight to the **testing phase** — `run-tests.sh` is the only
+convergence gate.
 
-- When woken after **Codex review**, consult `review-analyst`, make fixes, then write `.spec-loop/iterations/outer-<N>/inner/iter-<M>/claude-analysis.md`.
-- Before stopping, consult `convergence-judge` and write `decision.json` with `{"converged": bool, "reasoning": "..."}`. The hook needs this to decide iterate-vs-advance.
-- When moved to **testing phase**, run `bash "${CLAUDE_PLUGIN_ROOT}/scripts/run-tests.sh"`, then stop. The hook will read test results and either declare success or kick off a replan.
+- When moved to **testing**, run `bash "${CLAUDE_PLUGIN_ROOT}/scripts/run-tests.sh"`, then stop.
+- Tests pass → loop marks `done`.
+- Tests fail → hook kicks off a replan (outer_iter++); consult
+  `requirements-analyst` to incorporate the test output into plan.md.
 
 ## Safety reminders
 
