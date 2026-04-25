@@ -15,6 +15,15 @@ PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PLUGIN_ROOT}/scripts/lib-state.sh"
 # shellcheck disable=SC1091
 source "${PLUGIN_ROOT}/scripts/lib-tasks.sh"
+# shellcheck disable=SC1091
+source "${PLUGIN_ROOT}/scripts/lib-submodules.sh"
+
+# Detect if the project uses git submodules — only then do the extra work.
+SL_HAS_SUBMODULES=0
+if [[ -f "$CLAUDE_PROJECT_DIR/.gitmodules" ]] && \
+   git -C "$CLAUDE_PROJECT_DIR" config --file .gitmodules --get-regexp 'submodule\..*\.path' >/dev/null 2>&1; then
+  SL_HAS_SUBMODULES=1
+fi
 
 WAVE="${1:?wave number required}"
 MAX_PAR=$(state_get max_parallel); MAX_PAR=${MAX_PAR:-3}
@@ -71,6 +80,12 @@ for tid in "${TASK_IDS[@]}"; do
     tasks_append_error "$tid" "worktree_create_failed"
     continue
   fi
+  # Initialize submodules in the worktree with shared object alternates +
+  # `parent` remote so commits inside submodules survive worktree removal.
+  if (( SL_HAS_SUBMODULES )); then
+    sl_init_submodules_in_worktree "$WT" >> "$WAVE_LOG" 2>&1 || \
+      log_warn "run-wave[$WAVE]: submodule init failed for $tid (continuing)"
+  fi
   TASK_WORKTREE["$tid"]="$WT"
   TASK_BRANCH["$tid"]="$BR"
   tasks_update "$tid" worktree "$WT" status running started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -103,7 +118,22 @@ for pid in "${PIDS[@]}"; do
 done
 log_info "run-wave[$WAVE]: all subprocess finished"
 
-# ---- Merge each worktree's branch back to main branch (fast-forward safe) ----
+# ---- Pre-merge: push each successful task's submodule commits into parent ----
+# This makes the worktree-side submodule HEADs reachable from the parent
+# submodule store BEFORE the worktrees are deleted later. Without this step,
+# the inner submodule commits are orphaned on worktree removal and the
+# superproject branch ends up referencing dangling SHAs.
+if (( SL_HAS_SUBMODULES )); then
+  for tid in "${TIDS_IN_ORDER[@]}"; do
+    ST=$(tasks_get_field "$tid" status)
+    WT="${TASK_WORKTREE[$tid]:-}"
+    [[ "$ST" == "done" && -n "$WT" && -d "$WT" ]] || continue
+    sl_push_submodule_commits_to_parent "$WT" "$WAVE" "$tid" >> "$WAVE_LOG" 2>&1 || \
+      log_warn "run-wave[$WAVE]: submodule push-back failed for $tid"
+  done
+fi
+
+# ---- Merge each worktree's branch back to main branch ----
 cd "$CLAUDE_PROJECT_DIR"
 MAIN_BRANCH=$(git symbolic-ref --short -q HEAD 2>/dev/null || echo "main")
 FAILED_MERGES=()
@@ -118,12 +148,34 @@ for tid in "${TIDS_IN_ORDER[@]}"; do
   if [[ -z "$BR" ]]; then
     continue
   fi
-  # Fetch task branch into main repo (it's already there since same repo)
   echo "[merge] $tid branch=$BR" | tee -a "$WAVE_LOG"
-  if git merge --no-ff --no-edit "$BR" >> "$WAVE_LOG" 2>&1; then
+
+  # Two paths:
+  # 1. No submodules in the project — try plain `git merge`, fall back to
+  #    file-level cherry-pick of non-overlapping files (legacy behavior).
+  # 2. Submodules present — go straight to `sl_custom_merge_task` which
+  #    handles gitlink (160000) entries by cherry-picking the submodule's
+  #    inner commits onto the current submodule HEAD.
+  if (( SL_HAS_SUBMODULES )); then
+    if sl_custom_merge_task "$WAVE" "$tid" "$BR" >> "$WAVE_LOG" 2>&1; then
+      log_info "run-wave[$WAVE]: integrated $tid (submodule-aware)"
+    else
+      RC=$?
+      if (( RC == 2 )); then
+        log_info "run-wave[$WAVE]: $tid was a no-op (no diff)"
+      else
+        log_error "run-wave[$WAVE]: submodule-aware merge failed for $tid (rc=$RC)"
+        # Roll back any partial state
+        git reset --hard HEAD >> "$WAVE_LOG" 2>&1 || true
+        tasks_update "$tid" status failed
+        tasks_append_error "$tid" "submodule_merge_conflict"
+        FAILED_MERGES+=("$tid")
+      fi
+    fi
+  elif git merge --no-ff --no-edit "$BR" >> "$WAVE_LOG" 2>&1; then
     log_info "run-wave[$WAVE]: merged $tid"
   else
-    # Merge conflict: try cherry-pick fallback for non-overlapping files.
+    # Merge conflict (no submodules): legacy cherry-pick fallback.
     git merge --abort 2>/dev/null || true
     log_warn "run-wave[$WAVE]: merge conflict for $tid; attempting cherry-pick fallback"
     mapfile -t CHANGED < <(git diff --name-only "HEAD..${BR}" 2>/dev/null)
@@ -132,14 +184,12 @@ for tid in "${TIDS_IN_ORDER[@]}"; do
     for f in "${CHANGED[@]}"; do
       f="${f%$'\r'}"
       [[ -z "$f" ]] && continue
-      # File exists on branch; check if it's different on main
       if git ls-tree HEAD "$f" >/dev/null 2>&1; then
         if ! git diff --quiet "HEAD" "${BR}" -- "$f" 2>/dev/null; then
           CONFLICT_FILES+=("$f")
           continue
         fi
       fi
-      # Either the file is new (not on main) or unchanged on main → safe to adopt
       git checkout "$BR" -- "$f" >>"$WAVE_LOG" 2>&1 && CLEAN_COUNT=$((CLEAN_COUNT+1))
     done
     if (( CLEAN_COUNT > 0 )); then
@@ -152,12 +202,9 @@ for tid in "${TIDS_IN_ORDER[@]}"; do
           echo ""
           echo "## $tid — conflicting files (wave $WAVE)"
           echo ""
-          echo "These files were touched by both main and $tid; cherry-pick fallback"
-          echo "skipped them. Global-review must decide integration:"
           for cf in "${CONFLICT_FILES[@]}"; do echo "- \`$cf\`"; done
         } >> "$SPEC_LOOP_GLOBAL_DIR/deferred-from-waves.md"
       fi
-      # The task's code is mostly integrated → mark done so wave can advance.
       tasks_update "$tid" status done completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     else
       log_error "run-wave[$WAVE]: cherry-pick found 0 clean files for $tid; marking failed"
@@ -167,6 +214,11 @@ for tid in "${TIDS_IN_ORDER[@]}"; do
     fi
   fi
 done
+
+# Cleanup parent-submodule integration refs so they don't accumulate.
+if (( SL_HAS_SUBMODULES )); then
+  sl_cleanup_wave_refs "$WAVE" >> "$WAVE_LOG" 2>&1 || true
+fi
 
 # ---- Cleanup worktrees (optional: keep on failure for forensics) ----
 for tid in "${TIDS_IN_ORDER[@]}"; do
