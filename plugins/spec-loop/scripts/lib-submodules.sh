@@ -27,22 +27,35 @@
 #   sl_custom_merge_task <wave> <tid> <branch>  -> 0 success | 1 conflict | 2 noop
 #   sl_cleanup_wave_refs <wave>
 
+# Cross-platform `pwd` that returns a path git can actually read on Windows.
+# On Git Bash / MSYS2 / Cygwin, `pwd` defaults to MSYS-style ("/d/foo/bar")
+# which git's path normalizer chokes on when stored in alternates files or
+# config values ("unable to normalize alternate object path"). `pwd -W` (and
+# Cygwin's equivalent) returns the Windows-style absolute path ("D:/foo/bar").
+# On Linux/macOS `-W` is unknown, so fall back to plain `pwd`.
+sl_pwd_native() {
+  pwd -W 2>/dev/null || pwd
+}
+
 # Resolve the on-disk git directory for a submodule (handles `gitdir:` files).
+# Always returns a path that git accepts on the current OS (Windows-style on
+# Git Bash, posix-style elsewhere).
 sl_resolve_git_dir() {
   local subpath="$1"
   if [[ -d "$subpath/.git" ]]; then
-    printf '%s\n' "$subpath/.git"
+    printf '%s\n' "$( cd "$subpath/.git" && sl_pwd_native )"
     return 0
   fi
   if [[ -f "$subpath/.git" ]]; then
     local line
     line=$(head -1 "$subpath/.git" 2>/dev/null)
     line="${line#gitdir: }"
-    if [[ "$line" = /* ]]; then
-      printf '%s\n' "$line"
+    if [[ "$line" = /* || "$line" =~ ^[A-Za-z]:[/\\] ]]; then
+      # Already absolute (POSIX or Windows). Normalize via cd+pwd.
+      printf '%s\n' "$( cd "$line" 2>/dev/null && sl_pwd_native )"
     else
-      # Resolve relative path against subpath
-      printf '%s\n' "$(cd "$subpath" && cd "$line" && pwd)"
+      # Relative to subpath
+      printf '%s\n' "$( cd "$subpath" && cd "$line" && sl_pwd_native )"
     fi
     return 0
   fi
