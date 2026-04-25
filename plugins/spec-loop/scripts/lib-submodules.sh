@@ -85,16 +85,28 @@ sl_init_submodules_in_worktree() {
       | head -1 )
     [[ -z "$subname" ]] && subname="$sub"
 
-    # Override the submodule URL in the worktree's repo config to point at
-    # the parent submodule's git dir. This ensures `submodule update --init`
-    # fetches LOCAL commits (not just whatever is on the upstream remote).
+    # CORRECT order for URL override:
+    #   1. `git submodule init` — copies URL from .gitmodules to repo config.
+    #   2. `git config submodule.<name>.url <parent>` — overrides post-init.
+    #   3. `git submodule update` — clones using the overridden URL.
+    # If we set the config BEFORE init, the init step happily overwrites it
+    # back to the .gitmodules URL.
+    ( cd "$wt" && git submodule init -- "$sub" >/dev/null 2>&1 ) || true
     ( cd "$wt" && git config "submodule.${subname}.url" "$parent_sub_git" ) >/dev/null 2>&1 || true
+    # `submodule sync` propagates the URL into the submodule's own remote.
+    ( cd "$wt" && git submodule sync --recursive -- "$sub" >/dev/null 2>&1 ) || true
+    # Now do the actual checkout
+    if ! ( cd "$wt" && git submodule update --recursive -- "$sub" >/dev/null 2>&1 ); then
+      log_warn "sl_init: 'submodule update' failed for $sub in $wt — codex may retry; alternates+parent-remote will still be set up if dir exists"
+    fi
 
-    # Init submodule inside the worktree (fetches from parent local clone now)
-    ( cd "$wt" && git submodule update --init --recursive -- "$sub" >/dev/null 2>&1 ) || {
-      log_warn "sl_init: 'submodule update --init' failed for $sub in $wt"
+    # If the submodule dir/.git is still missing, we cannot continue with
+    # alternates / remote setup. Fall through; codex's own init may rescue it
+    # later but our push-back step won't have a `parent` remote then.
+    if [[ ! -e "$wt/$sub/.git" ]]; then
+      log_warn "sl_init: $wt/$sub/.git missing after init; skipping alternates+remote"
       continue
-    }
+    fi
 
     local wt_sub_git
     wt_sub_git=$(sl_resolve_git_dir "$wt/$sub") || {
@@ -114,9 +126,15 @@ sl_init_submodules_in_worktree() {
     fi
 
     # Add `parent` remote for push-back. URL is the parent submodule's git dir.
-    ( cd "$wt/$sub" && \
-      git remote remove parent >/dev/null 2>&1 ;
-      git remote add parent "$parent_sub_git" >/dev/null 2>&1 ) || true
+    # Best-effort but log the actual outcome so we can debug.
+    ( cd "$wt/$sub" && git remote remove parent ) >/dev/null 2>&1 || true
+    if ( cd "$wt/$sub" && git remote add parent "$parent_sub_git" ) >/dev/null 2>&1; then
+      log_info "sl_init: added 'parent' remote in $wt/$sub -> $parent_sub_git"
+    else
+      # Already exists with same URL (after the remove failed) — set-url instead.
+      ( cd "$wt/$sub" && git remote set-url parent "$parent_sub_git" ) >/dev/null 2>&1 || \
+        log_warn "sl_init: could not configure 'parent' remote in $wt/$sub"
+    fi
   done
   return 0
 }
@@ -152,6 +170,17 @@ sl_push_submodule_commits_to_parent() {
     parent_head=$( cd "$CLAUDE_PROJECT_DIR/$sub" 2>/dev/null && git rev-parse HEAD 2>/dev/null ) || parent_head=""
     if [[ "$wt_head" == "$parent_head" ]]; then
       continue
+    fi
+
+    # Make sure `parent` remote is configured. If sl_init bailed early
+    # (init failure) we fix it here. This makes push-back self-sufficient.
+    local parent_sub_git_local
+    parent_sub_git_local=$(sl_resolve_git_dir "$CLAUDE_PROJECT_DIR/$sub") || parent_sub_git_local=""
+    if [[ -n "$parent_sub_git_local" ]]; then
+      if ! ( cd "$wt/$sub" && git remote get-url parent >/dev/null 2>&1 ); then
+        ( cd "$wt/$sub" && git remote add parent "$parent_sub_git_local" ) >/dev/null 2>&1 || \
+          ( cd "$wt/$sub" && git remote set-url parent "$parent_sub_git_local" ) >/dev/null 2>&1 || true
+      fi
     fi
 
     local ref="refs/spec-loop/wave-${wave}/${tid}"
