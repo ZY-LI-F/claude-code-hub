@@ -31,7 +31,14 @@ source "${PLUGIN_ROOT}/scripts/lib-state.sh"
 source "${PLUGIN_ROOT}/scripts/lib-tasks.sh"
 
 TASK_ID="${1:?task_id required}"
-MAX_INNER="${SPEC_LOOP_MAX_INNER_ITER:-10}"
+# Prefer state.json's max_inner_iter (set by setup-spec-loop-multi.sh from
+# --max-inner / --no-review flags). Falls back to env, then default.
+_state_max_inner=$(state_get max_inner_iter 2>/dev/null || true)
+if [[ -n "$_state_max_inner" && "$_state_max_inner" =~ ^[0-9]+$ ]]; then
+  MAX_INNER="$_state_max_inner"
+else
+  MAX_INNER="${SPEC_LOOP_MAX_INNER_ITER:-10}"
+fi
 TIMEOUT_SEC="${SPEC_LOOP_TASK_TIMEOUT_SECONDS:-1800}"
 DIFF_CAP="${SPEC_LOOP_MAX_DIFF_BYTES:-204800}"
 

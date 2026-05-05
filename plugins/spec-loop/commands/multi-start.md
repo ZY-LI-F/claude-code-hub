@@ -1,6 +1,6 @@
 ---
-description: "Start a multi-task spec-loop: Claude plans a task DAG, up to 3 tasks run in parallel per wave in isolated git worktrees, each task drives its own Codex implement→review→fix→test loop; after all tasks merge, Codex does up to 5 rounds of whole-project review→fix→test until converged."
-argument-hint: "<one-line spec>"
+description: "Start a multi-task spec-loop: Claude plans a task DAG, up to 3 tasks run in parallel per wave in isolated git worktrees, each task drives its own Codex implement→review→fix→test loop; after all tasks merge, Codex does up to 5 rounds of whole-project review→fix→test until converged. Pass --no-review to skip review/fix entirely (codegen-only)."
+argument-hint: "<one-line spec> [--no-review] [--rounds=N] [--max-inner=N] [--parallel=N]"
 ---
 
 You are starting a **multi-task spec-loop** (v0.2). This is the DAG-parallel
@@ -20,14 +20,29 @@ L2  Single-task loop     : per-task codex implement→review→fix→test (self-
 
 ## Boot sequence
 
-1. **Initialize state**. Run:
+1. **Parse arguments and initialize state**. `$ARGUMENTS` is a single string
+   that may contain the spec text plus optional flags. Pass it through to the
+   setup script verbatim — the script splits the spec from the flags
+   (`--no-review`, `--rounds=N`, `--max-inner=N`, `--parallel=N`).
+
    ```bash
+   # Use bash word-splitting to forward each token (do NOT quote $ARGUMENTS as one).
    bash "${CLAUDE_PLUGIN_ROOT}/scripts/setup-spec-loop-multi.sh" \
      "$CLAUDE_SESSION_ID" \
-     "$ARGUMENTS"
+     $ARGUMENTS
    ```
+
    This creates `.spec-loop/` with `mode=multi`, records `multi_base_commit`,
-   detects the scenario, and puts phase in `task-planning`.
+   detects the scenario, and puts phase in `task-planning`. It also auto-backs
+   up any existing `plan.md`/`tasks.json`/`spec.md` to
+   `.spec-loop.backup-<UTC>/` before init.
+
+   **Flag examples:**
+   - `--no-review` — codegen-only (sets `--max-inner=1 --rounds=0`); each task
+     runs codex implement once, no review/fix loop, no global review.
+   - `--rounds=2` — global review/fix/test capped at 2 rounds (default 5).
+   - `--max-inner=3` — per-task inner cap 3 (default 10).
+   - `--parallel=2` — at most 2 tasks per wave (default 3).
 
 2. **Plan (Claude, L1 planner)**.
    - Consult the `spec-loop:requirements-analyst` agent to produce
@@ -59,13 +74,17 @@ L2  Single-task loop     : per-task codex implement→review→fix→test (self-
 
 ## Budgets
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SPEC_LOOP_MAX_PARALLEL` | 3 | Concurrent tasks per wave |
-| `SPEC_LOOP_MAX_GLOBAL_ROUNDS` | 5 | Whole-project review/fix/test rounds |
-| `SPEC_LOOP_MAX_INNER_ITER` | 10 | Per-task implement/review/fix cap |
-| `SPEC_LOOP_TASK_TIMEOUT_SECONDS` | 1800 | Per-task codex wall-clock timeout |
-| `SPEC_LOOP_MAX_WALL_SECONDS` | 18000 | Whole-loop wall-clock cap |
+Preferred way to set these is via flags at command launch (see Boot step 1).
+Env vars still work as a fallback for advanced/scripted usage.
+
+| Flag | Env (fallback) | Default | Meaning |
+|---|---|---|---|
+| `--parallel=N` | `SPEC_LOOP_MAX_PARALLEL` | 3 | Concurrent tasks per wave |
+| `--rounds=N` | `SPEC_LOOP_MAX_GLOBAL_ROUNDS` | 5 | Whole-project review/fix/test rounds (`0` = skip global review entirely) |
+| `--max-inner=N` | `SPEC_LOOP_MAX_INNER_ITER` | 10 | Per-task implement/review/fix cap (`1` = implement only, no review loop) |
+| `--no-review` | — | off | Shorthand for `--max-inner=1 --rounds=0` (pure codegen) |
+| — | `SPEC_LOOP_TASK_TIMEOUT_SECONDS` | 1800 | Per-task codex wall-clock timeout |
+| — | `SPEC_LOOP_MAX_WALL_SECONDS` | 18000 | Whole-loop wall-clock cap |
 
 ## Safety
 

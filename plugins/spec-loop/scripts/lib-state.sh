@@ -179,6 +179,7 @@ state = {
 if mode == "multi":
     state.update({
         "max_parallel": int(os.environ.get("SPEC_LOOP_MAX_PARALLEL", "3")),
+        "max_inner_iter": int(os.environ.get("SPEC_LOOP_MAX_INNER_ITER", "10")),
         "current_wave": 0,
         "global_round": 0,
         "max_global_rounds": int(os.environ.get("SPEC_LOOP_MAX_GLOBAL_ROUNDS", "5")),
@@ -274,7 +275,15 @@ session_matches() {
   local incoming="$1"
   local stored
   stored=$(state_get session_id)
-  [[ -n "$stored" && "$stored" == "$incoming" ]]
+  # 1) If stored is empty: treat as bootstrap / manual setup → accept any
+  #    session. (Trade-off: cross-session collision possible if two parallel
+  #    Claude sessions both touch the same .spec-loop/, but in practice
+  #    .spec-loop/ is per-repo and humans rarely run two sessions on one repo.)
+  # 2) Wildcard sentinel "*" or "any": same as empty.
+  if [[ -z "$stored" || "$stored" == "*" || "$stored" == "any" ]]; then
+    return 0
+  fi
+  [[ "$stored" == "$incoming" ]]
 }
 
 # ============================================================
